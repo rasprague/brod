@@ -1,0 +1,20 @@
+Richard Sprague
+rasprague@gmail.com
+
+This branch adds Kafka 0.7 message header support as well as preliminary gzip compression support.
+
+files modified:
+brod/base.py
+test/test_brod.py
+
+files added:
+brod/base.py.withautodecompress
+
+- 0.7 mesage header support is enabled via "VERSION_0_7 = True" in brod/base.py
+- Kafka.produce() accepts an optional compression argument, whose value can be one of COMPRESSION_NONE, COMPRESSION_GZIP, or COMPRESSION_SNAPPY (snappy compression support not yet implemented). This will automatically compress the message sequence sent to produce().
+- Automatic message decompression has been implemented in brod/base.py.withautodecompress. Unfortunately, this is sort of a hack (messages are decompressed into a MESSAGE_LIST array, doesn't quite fit the generator model in Kafka._parse_message_set() ), and it fails the "expected offset" portion of the unit test in test/test_brod.py
+- brod/base.py leaves out automatic message decompression at the moment, pushing the decompressing duties onto the client
+- test/test_brod.py has been modified to reflect the 0.7 message header size.
+- Also in test/test_brod.py, a new unit test, TestKafkaBlockingWithCompression, has been created to test gzip message set compression. This is largely a copy of TestKafkaBlocking, with the "expected offset" assert rearranged, and message decompression implemented.
+
+While gzip support genrally works (save for automatic decompression and offset calculations), I'm not 100% satisfied with the way it's implemented, e.g. I construct message headers in some odd places. Idealy I'd like to see compression support implemented in a more recurrsive manner, since compressed messages themselves are recurrsive, i.e a message whose payload is more messages.

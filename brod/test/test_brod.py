@@ -1,12 +1,17 @@
 import logging
 import time
 import unittest
+from cStringIO import StringIO
 from brod import (
     Kafka, 
     LATEST_OFFSET, EARLIEST_OFFSET, Lengths, 
     ConnectionFailure,
     OffsetOutOfRange,
     InvalidOffset,
+    COMPRESSION_NONE,
+    COMPRESSION_GZIP,
+    gzip_compress,
+    gzip_decompress
 )
 
 try:
@@ -66,6 +71,56 @@ class TestKafkaBlocking(unittest.TestCase):
             'wont appear')
 
     
+class TestKafkaBlockingWithCompression(unittest.TestCase):
+    def test_kafka(self):
+        kafka = Kafka()
+        topic = get_unique_topic('test-kafka')
+        start_offset = 0
+
+        input_messages = ['message0', 'message1', 'message2']
+
+        kafka.produce(topic, input_messages, compression=COMPRESSION_GZIP)
+        time.sleep(MESSAGE_DELAY_SECS)
+        fetch_results = kafka.fetch(topic, start_offset)
+
+        output_messages = []
+        offsets = []
+        for offset, output_message in fetch_results:
+            output_messages.append(output_message)
+            offsets.append(offset)
+
+        actual_latest_offsets = kafka.offsets(topic, LATEST_OFFSET, 
+            max_offsets=1)
+
+        self.assertEquals(len(actual_latest_offsets), 1)
+        expected_latest_offset = offsets[-1] + Lengths.MESSAGE_HEADER \
+            + len(output_messages[-1])
+        self.assertEquals(expected_latest_offset, actual_latest_offsets[0])
+
+        # decompress and parse messages
+        decompressed_payload = gzip_decompress(output_messages[0])
+        decompressed_payload_buffer = StringIO(decompressed_payload)
+        parse_results = kafka._parse_message_set(0, decompressed_payload_buffer)
+        output_messages = []
+        offsets = []
+        for offset, output_message in parse_results:
+            output_messages.append(output_message)
+            offsets.append(offset)
+        self.assertEquals(input_messages, output_messages)
+        
+        actual_earliest_offsets = kafka.offsets(topic, EARLIEST_OFFSET, 
+            max_offsets=1)
+
+        self.assertEquals(len(actual_earliest_offsets), 1)
+        self.assertEquals(0, actual_earliest_offsets[0])
+
+    def test_cant_connect(self):
+        kafka = Kafka(host=str(time.time()))
+        topic = get_unique_topic('test-cant-connect')
+
+        self.assertRaises(ConnectionFailure, kafka.produce, topic, 
+            'wont appear')
+            
 
 if has_tornado:
     class TestKafkaTornado(AsyncTestCase, LogTrapTestCase):
@@ -119,7 +174,10 @@ if has_tornado:
 
 class TestTopic(unittest.TestCase):
     # Contents of self.dogs_queue after setUp:
+    #  0.6
     #   [(0, 'Rusty'), (14, 'Patty'), (28, 'Jack'), (41, 'Clyde')]
+    #  0.7
+    #   [(0, 'Rusty'), (15, 'Patty'), (30, 'Jack'), (44, 'Clyde')]
     
     def setUp(self):
         self.k = Kafka()
@@ -132,23 +190,43 @@ class TestTopic(unittest.TestCase):
         # produce is duplicated (it really gets that way in Kafka).
         time.sleep(MESSAGE_DELAY_SECS)
         self.dogs_queue = self.k.topic(self.topic_name)
-        
+
         # print list(self.k.fetch(self.topic_name, 0))
         # print self.topic_name
         
     
     def test_offset_queries(self):
+        # 0.6
+        # self.assertEqual(self.dogs_queue.earliest_offset(), 0)
+        # self.assertEqual(self.dogs_queue.latest_offset(), 55)
+        # self.assertRaises(OffsetOutOfRange, self.dogs_queue.poll(100).next)
+        # self.assertRaises(InvalidOffset, self.dogs_queue.poll(22).next)
+        
+        # 0.7
         self.assertEqual(self.dogs_queue.earliest_offset(), 0)
-        self.assertEqual(self.dogs_queue.latest_offset(), 55)
+        self.assertEqual(self.dogs_queue.latest_offset(), 59)
         self.assertRaises(OffsetOutOfRange, self.dogs_queue.poll(100).next)
         self.assertRaises(InvalidOffset, self.dogs_queue.poll(22).next)
 
     def test_end_offset_iteration(self):
-        dogs = self.dogs_queue.poll(0, end_offset=28, poll_interval=None)
+        # 0.6
+        # dogs = self.dogs_queue.poll(0, end_offset=28, poll_interval=None)
+        # status, messages = dogs.next()
+        # self.assertEqual(status.start_offset, 0)
+        # self.assertEqual(status.next_offset, 41)
+        # self.assertEqual(status.last_offset_read, 28)
+        # self.assertEqual(status.messages_read, 3)
+        # self.assertEqual(status.bytes_read, 14)
+        # self.assertEqual(status.num_fetches, 1)
+        # self.assertEqual(messages, ['Rusty', 'Patty', 'Jack'])
+        # self.assertRaises(StopIteration, dogs.next)
+        
+        # 0.7
+        dogs = self.dogs_queue.poll(0, end_offset=30, poll_interval=None)
         status, messages = dogs.next()
         self.assertEqual(status.start_offset, 0)
-        self.assertEqual(status.next_offset, 41)
-        self.assertEqual(status.last_offset_read, 28)
+        self.assertEqual(status.next_offset, 44)
+        self.assertEqual(status.last_offset_read, 30)
         self.assertEqual(status.messages_read, 3)
         self.assertEqual(status.bytes_read, 14)
         self.assertEqual(status.num_fetches, 1)

@@ -85,7 +85,7 @@ class Lengths(object):
     MAGIC = 1
     COMPRESSION = 1
     CHECKSUM = 4
-    if VERSION_0_7:
+    if MAGIC_BYTE_07:
         MESSAGE_HEADER = MESSAGE_LENGTH + MAGIC + COMPRESSION + CHECKSUM
     else:
         MESSAGE_HEADER = MESSAGE_LENGTH + MAGIC + CHECKSUM
@@ -292,6 +292,7 @@ class BaseKafka(object):
         self.port   = port or 9092
         self.max_size = max_size or self.DEFAULT_MAX_SIZE
         self.include_corrupt = include_corrupt
+        self.MESSAGE_LIST = None
     
     # Public API
     
@@ -413,74 +414,96 @@ class BaseKafka(object):
         try:
             has_more = True
             while has_more:
-                offset = start_offset + message_buffer.tell() - Lengths.ERROR_CODE
-            
-                # Parse the message length (uint:4)
-                raw_message_length = message_buffer.read(Lengths.MESSAGE_LENGTH)
-            
-                if raw_message_length == '':
-                    break
-                elif len(raw_message_length) < Lengths.MESSAGE_LENGTH:
-                    kafka_log.error('Unexpected end of message set. Expected {0} bytes for message length, only read {1}'.format(Lengths.MESSAGE_LENGTH, len(raw_message_length)))
-                    break
-            
-                message_length = struct.unpack('>I', 
-                    raw_message_length)[0]
-            
-                # Parse the magic byte (int:1)
-                raw_magic = message_buffer.read(Lengths.MAGIC)
-                if len(raw_magic) < Lengths.MAGIC:
-                    kafka_log.error('Unexpected end of message set. Expected {0} bytes for magic byte, only read{1}'.format(Lengths.MAGIC, len(raw_magic)))
-                    break
-            
-                magic = struct.unpack('>B', raw_magic)[0]
-                if magic == 1:
-                    compression = message_buffer.read(Lengths.COMPRESSION)
-                    # We don't do anything with this at the moment.
-            
-                # Parse the checksum (int:4)
-                raw_checksum = message_buffer.read(Lengths.CHECKSUM)
-                if len(raw_checksum) < Lengths.CHECKSUM:
-                    kafka_log.error('Unexpected end of message set. Expected {0} bytes for checksum, only read {1}'.format(Lengths.CHECKSUM, len(raw_checksum)))
-                    break
+                if self.MESSAGE_LIST != None:
+                    if len(self.MESSAGE_LIST) > 0:
+                        item = self.MESSAGE_LIST.pop(0)
+                        yield item
+                    else:
+                        self.MESSAGE_LIST = None
+                        has_more = False
+                else:
+                    offset = start_offset + message_buffer.tell() - Lengths.ERROR_CODE
                 
-                checksum = struct.unpack('>i', raw_checksum)[0]
-            
-                # Parse the payload (variable length string)
-                if VERSION_0_7:
-                    payload_length = message_length - Lengths.MAGIC - Lengths.COMPRESSION - Lengths.CHECKSUM
-                else:
-                    payload_length = message_length - Lengths.MAGIC - Lengths.CHECKSUM
-                payload = message_buffer.read(payload_length)
-                if len(payload) < payload_length and not self.include_corrupt:
-                    # This is not an error - this happens everytime we reach
-                    # the end of the read buffer without having parsed a complete msg
-                    # kafka_log.error('Unexpected end of message set. Expected {0} bytes for payload, only read {1}'.format(payload_length, len(payload)))
-                    break
+                    # Parse the message length (uint:4)
+                    raw_message_length = message_buffer.read(Lengths.MESSAGE_LENGTH)
                 
-                actual_checksum = self.compute_checksum(payload)
+                    if raw_message_length == '':
+                        break
+                    elif len(raw_message_length) < Lengths.MESSAGE_LENGTH:
+                        kafka_log.error('Unexpected end of message set. Expected {0} bytes for message length, only read {1}'.format(Lengths.MESSAGE_LENGTH, len(raw_message_length)))
+                        break
+                
+                    message_length = struct.unpack('>I', 
+                        raw_message_length)[0]
+                
+                    # Parse the magic byte (int:1)
+                    raw_magic = message_buffer.read(Lengths.MAGIC)
+                    if len(raw_magic) < Lengths.MAGIC:
+                        kafka_log.error('Unexpected end of message set. Expected {0} bytes for magic byte, only read{1}'.format(Lengths.MAGIC, len(raw_magic)))
+                        break
+                
+                    magic = struct.unpack('>B', raw_magic)[0]
+                    if magic == 1:
+                        compression = message_buffer.read(Lengths.COMPRESSION)
+                        # We don't do anything with this at the moment.
+                
+                    # Parse the checksum (int:4)
+                    raw_checksum = message_buffer.read(Lengths.CHECKSUM)
+                    if len(raw_checksum) < Lengths.CHECKSUM:
+                        kafka_log.error('Unexpected end of message set. Expected {0} bytes for checksum, only read {1}'.format(Lengths.CHECKSUM, len(raw_checksum)))
+                        break
+                    
+                    checksum = struct.unpack('>i', raw_checksum)[0]
+                
+                    # Parse the payload (variable length string)
+                    if VERSION_0_7:
+                        payload_length = message_length - Lengths.MAGIC - Lengths.COMPRESSION - Lengths.CHECKSUM
+                    else:
+                        payload_length = message_length - Lengths.MAGIC - Lengths.CHECKSUM
+                    payload = message_buffer.read(payload_length)
+                    if len(payload) < payload_length and not self.include_corrupt:
+                        # This is not an error - this happens everytime we reach
+                        # the end of the read buffer without having parsed a complete msg
+                        # kafka_log.error('Unexpected end of message set. Expected {0} bytes for payload, only read {1}'.format(payload_length, len(payload)))
+                        break
+                    
+                    actual_checksum = self.compute_checksum(payload)
+                
+                    # compression support
+                    compression_codec = ord(compression)
+                    if compression_codec == COMPRESSION_GZIP:
+                        payload = gzip_decompress(payload)
+                        print "******* payload = ", payload
+                        print "******* len(payload) = ", len(payload)
+                        payload_buffer = StringIO(payload)
+                        self.MESSAGE_LIST = list(self._parse_message_set(start_offset, payload_buffer, include_corrupt))
+                        print "********* MESSAGE_LIST = ", self.MESSAGE_LIST
+                        item = self.MESSAGE_LIST.pop(0)
+                        yield item
+                    elif compression_codec == COMPRESSION_SNAPPY:
+                        raise NotImplementedError()
+                    else:    
+                        if VERSION_0_7:
+                            if magic != MAGIC_BYTE_07:
+                                kafka_log.error('Unexpected magic byte: {0} (expecting {1})'.format(magic, MAGIC_BYTE_07))
+                                corrupt = True
+                        else:
+                            if magic != MAGIC_BYTE_06:
+                                kafka_log.error('Unexpected magic byte: {0} (expecting {1})'.format(magic, MAGIC_BYTE_06))
+                                corrupt = True
             
-                if VERSION_0_7:
-                    if magic != MAGIC_BYTE_07:
-                        kafka_log.error('Unexpected magic byte: {0} (expecting {1})'.format(magic, MAGIC_BYTE_07))
-                        corrupt = True
-                else:
-                    if magic != MAGIC_BYTE_06:
-                        kafka_log.error('Unexpected magic byte: {0} (expecting {1})'.format(magic, MAGIC_BYTE_06))
-                        corrupt = True
-    
-                if checksum != actual_checksum:
-                    kafka_log.error('Checksum failure at offset {0}'.format(offset))
-                    corrupt = True
-                else:
-                    corrupt = False
+                        if checksum != actual_checksum:
+                            kafka_log.error('Checksum failure at offset {0}'.format(offset))
+                            corrupt = True
+                        else:
+                            corrupt = False
 
-                if include_corrupt:
-                    # kafka_log.debug('message {0}: (offset: {1}, {2} bytes, corrupt: {3})'.format(payload, offset, message_length, corrupt))
-                    yield offset, payload, corrupt
-                else:
-                    # kafka_log.debug('message {0}: (offset: {1}, {2} bytes)'.format(payload, offset, message_length))
-                    yield offset, payload
+                        if include_corrupt:
+                            # kafka_log.debug('message {0}: (offset: {1}, {2} bytes, corrupt: {3})'.format(payload, offset, message_length, corrupt))
+                            yield offset, payload, corrupt
+                        else:
+                            # kafka_log.debug('message {0}: (offset: {1}, {2} bytes)'.format(payload, offset, message_length))
+                            yield offset, payload
         except:
             kafka_log.error("Unexpected error:{0}".format(sys.exc_info()[0]))
         finally:
@@ -549,6 +572,7 @@ class BaseKafka(object):
                 compressed_message_set_buffer.write(struct.pack(compressed_bin_format, compressed_message_size,
                     encoded_compressed_message_set))
                 message_set = compressed_message_set_buffer.getvalue()
+                print "********* len(message_set) = ", len(message_set)
             elif compression == COMPRESSION_SNAPPY:
                 raise NotImplementedError()
         else:
