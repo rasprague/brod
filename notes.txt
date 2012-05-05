@@ -1,4 +1,4 @@
-Richard Sprague
+Richard "spike" Sprague
 rasprague@gmail.com
 
 This branch adds Kafka 0.7 message header support as well as preliminary gzip compression support.
