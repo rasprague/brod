@@ -4,7 +4,7 @@ import unittest
 from cStringIO import StringIO
 from brod import (
     Kafka, 
-    LATEST_OFFSET, EARLIEST_OFFSET, Lengths, 
+    LATEST_OFFSET, EARLIEST_OFFSET, 
     ConnectionFailure,
     OffsetOutOfRange,
     InvalidOffset,
@@ -53,7 +53,7 @@ class TestKafkaBlocking(unittest.TestCase):
             max_offsets=1)
             
         self.assertEquals(len(actual_latest_offsets), 1)
-        expected_latest_offset = offsets[-1] + Lengths.MESSAGE_HEADER \
+        expected_latest_offset = offsets[-1] + kafka.lengths.MESSAGE_HEADER \
             + len(output_messages[-1])
         self.assertEquals(expected_latest_offset, actual_latest_offsets[0])
         
@@ -93,7 +93,7 @@ class TestKafkaBlockingWithCompression(unittest.TestCase):
             max_offsets=1)
 
         self.assertEquals(len(actual_latest_offsets), 1)
-        expected_latest_offset = offsets[-1] + Lengths.MESSAGE_HEADER \
+        expected_latest_offset = offsets[-1] + kafka.lengths.MESSAGE_HEADER \
             + len(output_messages[-1])
         self.assertEquals(expected_latest_offset, actual_latest_offsets[0])
 
@@ -152,7 +152,7 @@ if has_tornado:
             actual_latest_offsets = self.wait()
 
             self.assertEquals(len(actual_latest_offsets), 1)
-            expected_latest_offset = offsets[-1] + Lengths.MESSAGE_HEADER \
+            expected_latest_offset = offsets[-1] + kafka.lengths.MESSAGE_HEADER \
                 + len(output_messages[-1])
             self.assertEquals(expected_latest_offset, 
                 actual_latest_offsets[0])
