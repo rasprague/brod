@@ -11,7 +11,11 @@ from brod import (
     COMPRESSION_NONE,
     COMPRESSION_GZIP,
     gzip_compress,
-    gzip_decompress
+    gzip_decompress,
+    MessageSet,
+    Message,
+    CompressedMessage,
+    Lengths
 )
 
 try:
@@ -39,7 +43,8 @@ class TestKafkaBlocking(unittest.TestCase):
         
         kafka.produce(topic, input_messages)
         time.sleep(MESSAGE_DELAY_SECS)
-        fetch_results = kafka.fetch(topic, start_offset)
+        messageSet = kafka.fetch(topic, start_offset)
+        fetch_results = messageSet._offsets_msgs
         
         output_messages = []
         offsets = []
@@ -53,7 +58,7 @@ class TestKafkaBlocking(unittest.TestCase):
             max_offsets=1)
             
         self.assertEquals(len(actual_latest_offsets), 1)
-        expected_latest_offset = offsets[-1] + kafka.lengths.MESSAGE_HEADER \
+        expected_latest_offset = offsets[-1] + Lengths.MESSAGE_HEADER_07 \
             + len(output_messages[-1])
         self.assertEquals(expected_latest_offset, actual_latest_offsets[0])
         
@@ -81,11 +86,14 @@ class TestKafkaBlockingWithCompression(unittest.TestCase):
 
         kafka.produce(topic, input_messages, compression=COMPRESSION_GZIP)
         time.sleep(MESSAGE_DELAY_SECS)
-        fetch_results = kafka.fetch(topic, start_offset)
+        messageSet = kafka.fetch(topic, start_offset)
+        fetch_results = messageSet._offsets_msgs
 
         output_messages = []
         offsets = []
-        for offset, output_message in fetch_results:
+        
+        for message in fetch_results:
+            offset, output_message = message
             output_messages.append(output_message)
             offsets.append(offset)
 
@@ -93,27 +101,31 @@ class TestKafkaBlockingWithCompression(unittest.TestCase):
             max_offsets=1)
 
         self.assertEquals(len(actual_latest_offsets), 1)
-        expected_latest_offset = offsets[-1] + kafka.lengths.MESSAGE_HEADER \
-            + len(output_messages[-1])
+        expected_latest_offset = offsets[-1] + Lengths.MESSAGE_HEADER_07 + len(output_messages[-1])
         self.assertEquals(expected_latest_offset, actual_latest_offsets[0])
 
-        # decompress and parse messages
-        decompressed_payload = gzip_decompress(output_messages[0])
-        decompressed_payload_buffer = StringIO(decompressed_payload)
-        parse_results = kafka._parse_message_set(0, decompressed_payload_buffer)
-        output_messages = []
-        offsets = []
-        for offset, output_message in parse_results:
-            output_messages.append(output_message)
-            offsets.append(offset)
-        self.assertEquals(input_messages, output_messages)
-        
         actual_earliest_offsets = kafka.offsets(topic, EARLIEST_OFFSET, 
             max_offsets=1)
 
         self.assertEquals(len(actual_earliest_offsets), 1)
         self.assertEquals(0, actual_earliest_offsets[0])
 
+        # decompress any compressed messages, do check
+        output_messages = []
+        offsets = []
+        for message in fetch_results:
+            if type(message) == CompressedMessage:
+                cMessageSet = message.messageSet()
+                for cMessage in cMessageSet._offsets_msgs:
+                    offset, output_message = cMessage
+                    output_messages.append(output_message)
+                    offsets.append(offset)
+            else:
+                offset, output_message = message
+                output_messages.append(output_message)
+                offsets.append(offset)
+                
+        self.assertEquals(input_messages, output_messages)
     def test_cant_connect(self):
         kafka = Kafka(host=str(time.time()))
         topic = get_unique_topic('test-cant-connect')
@@ -152,7 +164,7 @@ if has_tornado:
             actual_latest_offsets = self.wait()
 
             self.assertEquals(len(actual_latest_offsets), 1)
-            expected_latest_offset = offsets[-1] + kafka.lengths.MESSAGE_HEADER \
+            expected_latest_offset = offsets[-1] + Lengths.MESSAGE_HEADER_07 \
                 + len(output_messages[-1])
             self.assertEquals(expected_latest_offset, 
                 actual_latest_offsets[0])
@@ -180,7 +192,7 @@ class TestTopic(unittest.TestCase):
     #   [(0, 'Rusty'), (15, 'Patty'), (30, 'Jack'), (44, 'Clyde')]
     
     def setUp(self):
-        self.k = Kafka()
+        self.k = Kafka(version_0_7=True)
         self.topic_name = get_unique_topic('test-kafka-topic')
         input_messages = ['Rusty', 'Patty', 'Jack', 'Clyde']
         self.k.produce(self.topic_name, input_messages)
@@ -232,8 +244,6 @@ class TestTopic(unittest.TestCase):
         self.assertEqual(status.num_fetches, 1)
         self.assertEqual(messages, ['Rusty', 'Patty', 'Jack'])
         self.assertRaises(StopIteration, dogs.next)
-    
-        
 
 if __name__ == '__main__':
     logging.basicConfig(

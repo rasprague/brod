@@ -29,7 +29,11 @@ __all__ = [
     'COMPRESSION_GZIP',
     'COMPRESSION_SNAPPY',
     'gzip_compress',
-    'gzip_decompress'
+    'gzip_decompress',
+    'MessageSet',
+    'Message',
+    'CompressedMessage',
+    'Lengths'
 ]
 
 class KafkaError(Exception): pass
@@ -158,7 +162,75 @@ class FetchResult(object):
     def num_bytes(self):
         return sum(msg_set.size for msg_set in self)
 
+def compute_checksum(value):
+    return binascii.crc32(value)
+    
+class Lengths(object):
+    ERROR_CODE = 2
+    RESPONSE_SIZE = 4
+    REQUEST_TYPE = 2
+    TOPIC_LENGTH = 2
+    PARTITION = 4
+    OFFSET = 8
+    OFFSET_COUNT = 4
+    MAX_NUM_OFFSETS = 4
+    MAX_REQUEST_SIZE = 4
+    TIME_VAL = 8
+    MESSAGE_LENGTH = 4
+    MAGIC = 1
+    COMPRESSION = 1
+    CHECKSUM = 4
+    MESSAGE_HEADER_07 = MESSAGE_LENGTH + MAGIC + COMPRESSION + CHECKSUM
+    MESSAGE_HEADER_06 = MESSAGE_LENGTH + MAGIC + CHECKSUM
 
+class Message(object):
+    def __init__(self, offset, payload, corrupt=None):
+        self.offset = offset
+        self.payload = payload
+        self.corrupt = corrupt
+        self.current = 0 # for __iter__
+    # sp everything below here is for __iter__ support
+    #    (only so the unit tests don't have to change too much. this shit should be removed)
+    def __len__(self):
+        if self.corrupt:
+            return 3
+        else:
+            return 2
+    def __getitem__(self, key):
+        if type(key) == str:
+            try:
+                return self.__getattribute__(key)
+            except AttributeError:
+                raise KeyError(key)
+        elif type(key) == int:
+            if key == 0:
+                return self.offset
+            elif key == 1:
+                return self.payload
+            elif key == 2:
+                return self.corrupt
+            else:
+                raise KeyError(key)
+    def __iter__(self):
+        return self
+    def next(self):
+        if self.current > (len(self)-1):
+            raise StopIteration
+        else:
+            self.current += 1
+            return self.__getitem__(self.current-1)
+    
+class CompressedMessage(Message):
+    def __init__(self, offset, payload, corrupt=None):
+        super(CompressedMessage, self).__init__(offset, payload, corrupt)
+        self._messageSet = None
+    def messageSet(self):
+        if not self._messageSet:
+            uncompressed_payload = gzip_decompress(self.payload)
+            payload_buffer = StringIO(uncompressed_payload)
+            self._messageSet = MessageSet(payload_buffer, self.offset, self.corrupt)
+        return self._messageSet
+    
 class MessageSet(object):
     """A collection of messages and offsets returned from a request made to
     a single broker/topic/partition. Allows you to iterate via (offset, msg)
@@ -167,30 +239,28 @@ class MessageSet(object):
     ZK info might not be available if this came from a regular multifetch. This
     should be moved to base.
     """
-    def __init__(self, broker_partition, start_offset, offsets_msgs, _version_0_7=True):
-        self._broker_partition = broker_partition
-        self._start_offset = start_offset
-        self._offsets_msgs = offsets_msgs[:]
-        self._version_0_7 = _version_0_7
-    
-    ################## Where did I come from? ##################
-    @property
-    def broker_partition(self):
-        return self._broker_partition
-
-    @property
-    def topic(self):
-        return self.broker_partition.topic
-
-    ################## What do I have inside? ##################
+    def __init__(self, data_buf, offset=0, corrupt=False):
+        self._offsets_msgs = list(self.parse(offset, data_buf, corrupt))
+        
+#        def __init__(self, broker_partition, start_offset, offsets_msgs, _version_0_7=True):
+    # ################## Where did I come from? ##################
+    # @property
+    # def broker_partition(self):
+    #     return self._broker_partition
+    # 
+    # @property
+    # def topic(self):
+    #     return self.broker_partition.topic
+    # 
+    # ################## What do I have inside? ##################
     @property
     def offsets(self):
         return [offset for offset, msg in self]
-
+    
     @property
     def messages(self):
         return [msg for offset, msg in self]
-
+    
     @property
     def start_offset(self):
         return self.offsets[0] if self else None
@@ -198,7 +268,7 @@ class MessageSet(object):
     @property
     def end_offset(self):
         return self.offsets[-1] if self else None
-
+    
     @property
     def next_offset(self):
         # FIXME FIXME FIXME: This calcuation should be done at a much deeper
@@ -206,91 +276,128 @@ class MessageSet(object):
         # to detect the difference between 0.6 and 0.7 headers
         if not self:
             return self._start_offset # We didn't read anything
-
-        MESSAGE_HEADER_SIZE = 10 if self._version_0_7 else 9
+    
+        MESSAGE_HEADER_SIZE = MESSAGE_HEADER_07 if self._version_0_7 else MESSAGE_HEADER_06
         last_offset, last_msg = self._offsets_msgs[-1]
         next_offset = last_offset + len(last_msg) + MESSAGE_HEADER_SIZE
         return next_offset
-
+    
     @property
     def size(self):
         return sum(len(msg) for msg in self.messages)
-
+    
     def __iter__(self):
         return iter(self._offsets_msgs)
     
     def __len__(self):
         return len(self._offsets_msgs)
-
-    def __cmp__(self, other):
-        bp_cmp = cmp(self.broker_partition, other.broker_partition)
-        if bp_cmp:
-            return bp_cmp
-        else:
-            return cmp(self._offsets_msgs, other.offsets_msgs)
-
-    def __unicode__(self):
-        return "Broker Partition: {0}\nContents: {1}".format(self.broker_partition, self._offsets_msgs)
+    
+    # def __cmp__(self, other):
+    #     bp_cmp = cmp(self.broker_partition, other.broker_partition)
+    #     if bp_cmp:
+    #         return bp_cmp
+    #     else:
+    #         return cmp(self._offsets_msgs, other.offsets_msgs)
+    # 
+    # def __unicode__(self):
+    #     return "Broker Partition: {0}\nContents: {1}".format(self.broker_partition, self._offsets_msgs)
 
     ################## Parse from binary ##################
-    @classmethod
-    def parse(self, data_buff):
-        pass
-        # 
-        # MIN_MSG_SIZE = Lengths.MESSAGE_LENGTH + Lengths.MAGIC + Lengths.CHECKSUM
-# 
-        # def parse_message(msg_len, msg_data):
-        #     pass
-# 
-        # req_len, req_type, topic_len = struct.unpack(">IHH", data_buff.read(12))
-        # topic = unicode(buffer.read(topic_len), encoding='utf-8')
-# 
-# 
-        # # data_len = 
-# 
-        # message_buffer.read(Lengths.MESSAGE_LENGTH)
-# 
-        # messages = [parse_message(msg_data) for msg_data in data]
-# 
-        # message_buffer.read(Lengths.MESSAGE_LENGTH)
-# 
-# 
-# 
-        # raise NotImplementedError()
+    def parse(self, start_offset, message_buffer, include_corrupt=False):
+        offset = start_offset
+        compression = COMPRESSION_NONE
+        
+        try:
+            has_more = True
+            while has_more:
+                offset = start_offset + message_buffer.tell() - Lengths.ERROR_CODE
 
+                # Parse the message length (uint:4)
+                raw_message_length = message_buffer.read(Lengths.MESSAGE_LENGTH)
+
+                if raw_message_length == '':
+                    break
+                elif len(raw_message_length) < Lengths.MESSAGE_LENGTH:
+                    kafka_log.error('Unexpected end of message set. Expected {0} bytes for message length, only read {1}'.format(Lengths.MESSAGE_LENGTH, len(raw_message_length)))
+                    break
+
+                message_length = struct.unpack('>I', 
+                    raw_message_length)[0]
+
+                # Parse the magic byte (int:1)
+                raw_magic = message_buffer.read(Lengths.MAGIC)
+                if len(raw_magic) < Lengths.MAGIC:
+                    kafka_log.error('Unexpected end of message set. Expected {0} bytes for magic byte, only read{1}'.format(Lengths.MAGIC, len(raw_magic)))
+                    break
+
+                magic = struct.unpack('>B', raw_magic)[0]
+                if magic == MAGIC_BYTE_06:
+                    header_is_version_0_7 = False
+                elif magic == MAGIC_BYTE_07:
+                    header_is_version_0_7 = True
+                    compression = message_buffer.read(Lengths.COMPRESSION)
+                else:
+                    header_is_version_0_7 = False # sp what should be the default on error?
+                    kafka_log.error('Unexpected magic byte: {0} (expecting {1} or {2})'.format(magic, MAGIC_BYTE_06, MAGIC_BYTE_07))
+                    corrupt = True
+
+                self._version_0_7 = header_is_version_0_7   
+
+                # Parse the checksum (int:4)
+                raw_checksum = message_buffer.read(Lengths.CHECKSUM)
+                if len(raw_checksum) < Lengths.CHECKSUM:
+                    kafka_log.error('Unexpected end of message set. Expected {0} bytes for checksum, only read {1}'.format(Lengths.CHECKSUM, len(raw_checksum)))
+                    break
+
+                checksum = struct.unpack('>i', raw_checksum)[0]
+
+                # Parse the payload (variable length string)
+                if header_is_version_0_7:
+                    payload_length = message_length - Lengths.MAGIC - Lengths.COMPRESSION - Lengths.CHECKSUM
+                else:
+                    payload_length = message_length - Lengths.MAGIC - Lengths.CHECKSUM
+                payload = message_buffer.read(payload_length)
+
+                if len(payload) < payload_length and not include_corrupt:
+                    # This is not an error - this happens everytime we reach
+                    # the end of the read buffer without having parsed a complete msg
+                    # kafka_log.error('Unexpected end of message set. Expected {0} bytes for payload, only read {1}'.format(payload_length, len(payload)))
+                    break
+
+                actual_checksum = compute_checksum(payload)
+                if checksum != actual_checksum:
+                    kafka_log.error('Checksum failure at offset {0}'.format(offset))
+                    corrupt = True
+                else:
+                    corrupt = False
+
+                if include_corrupt:
+                    # kafka_log.debug('message {0}: (offset: {1}, {2} bytes, corrupt: {3})'.format(payload, offset, message_length, corrupt))
+                    if ord(compression) == COMPRESSION_GZIP:
+                        yield CompressedMessage(offset, payload, corrupt)
+                    else:
+                        yield Message(offset, payload, corrupt)
+                else:
+                    # kafka_log.debug('message {0}: (offset: {1}, {2} bytes)'.format(payload, offset, message_length))
+                    if ord(compression) == COMPRESSION_GZIP:
+                        yield CompressedMessage(offset, payload)
+                    else:
+                        yield Message(offset, payload)
+        except Exception as e:
+            kafka_log.error("Unexpected error:{0} ({1})".format(sys.exc_info()[0], e))
+        finally:
+            message_buffer.close()
 
 class BaseKafka(object):
     MAX_RETRY = 3
     DEFAULT_MAX_SIZE = 1024 * 1024
-    
-    class Lengths(object):
-        def __init__(self, version_0_7=True):
-            self.ERROR_CODE = 2
-            self.RESPONSE_SIZE = 4
-            self.REQUEST_TYPE = 2
-            self.TOPIC_LENGTH = 2
-            self.PARTITION = 4
-            self.OFFSET = 8
-            self.OFFSET_COUNT = 4
-            self.MAX_NUM_OFFSETS = 4
-            self.MAX_REQUEST_SIZE = 4
-            self.TIME_VAL = 8
-            self.MESSAGE_LENGTH = 4
-            self.MAGIC = 1
-            self.COMPRESSION = 1
-            self.CHECKSUM = 4
-            if version_0_7:
-                self.MESSAGE_HEADER = self.MESSAGE_LENGTH + self.MAGIC + self.COMPRESSION + self.CHECKSUM
-            else:
-                self.MESSAGE_HEADER = self.MESSAGE_LENGTH + self.MAGIC + self.CHECKSUM
-            
+                
     def __init__(self, host=None, port=None, max_size=None, include_corrupt=False, version_0_7=True):
         self.host   = host or 'localhost'
         self.port   = port or 9092
         self.max_size = max_size or self.DEFAULT_MAX_SIZE
         self.include_corrupt = include_corrupt
         self.version_0_7 = version_0_7
-        self.lengths = self.Lengths(version_0_7)
     
     # Public API
     
@@ -343,7 +450,7 @@ class BaseKafka(object):
                 fetch_request_size, 
                 partial(self._wrote_request_size, 
                         fetch_request, 
-                        partial(self._read_fetch_response, 
+                        partial(self.messageSetFromBuffer, 
                                 callback, 
                                 offset, 
                                 include_corrupt
@@ -390,13 +497,10 @@ class BaseKafka(object):
     # Private methods
 
     # Response decoding methods
-    
-    def _read_fetch_response(self, callback, start_offset, include_corrupt, 
-            message_buffer):
+    def messageSetFromBuffer(self, callback, start_offset, include_corrupt, message_buffer):
         if message_buffer:
-            messages = list(self._parse_message_set(
-                start_offset, message_buffer, include_corrupt)
-            )
+            messageSet = MessageSet(message_buffer, start_offset, include_corrupt)
+            messages = messageSet
         else:
             messages = []
 
@@ -404,94 +508,16 @@ class BaseKafka(object):
             return callback(messages)
         else:
             return messages
-
-    def _parse_message_set(self, start_offset, message_buffer, 
-            include_corrupt=False):
-        offset = start_offset
-        
-        try:
-            has_more = True
-            while has_more:
-                offset = start_offset + message_buffer.tell() - self.lengths.ERROR_CODE
-            
-                # Parse the message length (uint:4)
-                raw_message_length = message_buffer.read(self.lengths.MESSAGE_LENGTH)
-            
-                if raw_message_length == '':
-                    break
-                elif len(raw_message_length) < self.lengths.MESSAGE_LENGTH:
-                    kafka_log.error('Unexpected end of message set. Expected {0} bytes for message length, only read {1}'.format(self.lengths.MESSAGE_LENGTH, len(raw_message_length)))
-                    break
-            
-                message_length = struct.unpack('>I', 
-                    raw_message_length)[0]
-            
-                # Parse the magic byte (int:1)
-                raw_magic = message_buffer.read(self.lengths.MAGIC)
-                if len(raw_magic) < self.lengths.MAGIC:
-                    kafka_log.error('Unexpected end of message set. Expected {0} bytes for magic byte, only read{1}'.format(self.lengths.MAGIC, len(raw_magic)))
-                    break
-            
-                magic = struct.unpack('>B', raw_magic)[0]
-                
-                if magic == MAGIC_BYTE_06:
-                    header_is_version_0_7 = False
-                elif magic == MAGIC_BYTE_07:
-                    header_is_version_0_7 = True
-                    compression = message_buffer.read(self.lengths.COMPRESSION)
-                else:
-                    header_is_version_0_7 = False # sp what should be the default on error?
-                    kafka_log.error('Unexpected magic byte: {0} (expecting {1} or {2})'.format(magic, MAGIC_BYTE_06, MAGIC_BYTE_07))
-                    corrupt = True
-            
-                # Parse the checksum (int:4)
-                raw_checksum = message_buffer.read(self.lengths.CHECKSUM)
-                if len(raw_checksum) < self.lengths.CHECKSUM:
-                    kafka_log.error('Unexpected end of message set. Expected {0} bytes for checksum, only read {1}'.format(self.lengths.CHECKSUM, len(raw_checksum)))
-                    break
-                
-                checksum = struct.unpack('>i', raw_checksum)[0]
-                
-                # Parse the payload (variable length string)
-                if header_is_version_0_7:
-                    payload_length = message_length - self.lengths.MAGIC - self.lengths.COMPRESSION - self.lengths.CHECKSUM
-                else:
-                    payload_length = message_length - self.lengths.MAGIC - self.lengths.CHECKSUM
-                payload = message_buffer.read(payload_length)
-                if len(payload) < payload_length and not self.include_corrupt:
-                    # This is not an error - this happens everytime we reach
-                    # the end of the read buffer without having parsed a complete msg
-                    # kafka_log.error('Unexpected end of message set. Expected {0} bytes for payload, only read {1}'.format(payload_length, len(payload)))
-                    break
-                
-                actual_checksum = self.compute_checksum(payload)
     
-                if checksum != actual_checksum:
-                    kafka_log.error('Checksum failure at offset {0}'.format(offset))
-                    corrupt = True
-                else:
-                    corrupt = False
-
-                if include_corrupt:
-                    # kafka_log.debug('message {0}: (offset: {1}, {2} bytes, corrupt: {3})'.format(payload, offset, message_length, corrupt))
-                    yield offset, payload, corrupt
-                else:
-                    # kafka_log.debug('message {0}: (offset: {1}, {2} bytes)'.format(payload, offset, message_length))
-                    yield offset, payload
-        except:
-            kafka_log.error("Unexpected error:{0}".format(sys.exc_info()[0]))
-        finally:
-            message_buffer.close()
-
     def _read_offset_response(self, callback, data):
         # The number of offsets received (uint:4)
-        raw_offset_count = data.read(self.lengths.OFFSET_COUNT)
+        raw_offset_count = data.read(Lengths.OFFSET_COUNT)
         offset_count = struct.unpack('>L', raw_offset_count)[0]
 
         offsets = []
         has_more = True
         for i in range(offset_count):
-            raw_offset = data.read(self.lengths.OFFSET)
+            raw_offset = data.read(Lengths.OFFSET)
             offset = struct.unpack('>Q', raw_offset)[0]
             offsets.append(offset)
 
@@ -572,12 +598,12 @@ class BaseKafka(object):
         # Build fetch request request
         topic_length = len(topic)
         request_size = sum([
-            self.lengths.REQUEST_TYPE,
-            self.lengths.TOPIC_LENGTH, # length of the topic length
+            Lengths.REQUEST_TYPE,
+            Lengths.TOPIC_LENGTH, # length of the topic length
             topic_length,
-            self.lengths.PARTITION,
-            self.lengths.OFFSET,
-            self.lengths.MAX_REQUEST_SIZE
+            Lengths.PARTITION,
+            Lengths.OFFSET,
+            Lengths.MAX_REQUEST_SIZE
         ])
         request = (
             FETCH_REQUEST, 
@@ -598,12 +624,12 @@ class BaseKafka(object):
     
     def _offsets_request(self, topic, time_val, max_offsets, partition):
         offsets_request_size = sum([
-            self.lengths.REQUEST_TYPE,
-            self.lengths.TOPIC_LENGTH,
+            Lengths.REQUEST_TYPE,
+            Lengths.TOPIC_LENGTH,
             len(topic),
-            self.lengths.PARTITION,
-            self.lengths.TIME_VAL,
-            self.lengths.MAX_NUM_OFFSETS,
+            Lengths.PARTITION,
+            Lengths.TIME_VAL,
+            Lengths.MAX_NUM_OFFSETS,
         ])
         
         offsets_request = (
@@ -630,7 +656,7 @@ class BaseKafka(object):
 
     def _wrote_request(self, callback):
         # Read the first 4 bytes, which is the response size (unsigned int)
-        return self._read(self.lengths.RESPONSE_SIZE, 
+        return self._read(Lengths.RESPONSE_SIZE, 
             partial(self._read_response_size, callback))
 
     def _read_response_size(self, callback, raw_buf_length):
@@ -642,7 +668,7 @@ class BaseKafka(object):
     def _read_response(self, callback, data):
         # Check if there is a non zero error code (2 byte unsigned int):
         response_buffer = StringIO(data)
-        raw_error_code = response_buffer.read(self.lengths.ERROR_CODE)
+        raw_error_code = response_buffer.read(Lengths.ERROR_CODE)
         error_code = struct.unpack('>H', raw_error_code)[0]
         if error_code != 0:
             raise error_codes.get(error_code, UnknownError)('Code: {0}'.format(error_code))
@@ -675,7 +701,7 @@ class BaseKafka(object):
     def partition(self, topic, partition=None):
         """Return a Partition object that knows how to iterate through messages
         in a topic/partition."""
-        return Partition(self, topic, partition)
+        return Partition(self, topic, partition, version_0_7=self.version_0_7)
 
 
 # By David Ormsbee (dave@datadog.com):
@@ -761,10 +787,7 @@ class Partition(object):
         # Kafka msg headers are 
         #   (0.6) 9 bytes: 4=len(msg), 1=magic val, 4=CRC
         #   (0.7) 10 bytes: 4=len(msg), 1=magic val, 1=compression scheme, 4=CRC
-        if self._version_0_7:
-            MESSAGE_HEADER_SIZE = 10
-        else:
-            MESSAGE_HEADER_SIZE = 9
+        MESSAGE_HEADER_SIZE = Lengths.MESSAGE_HEADER_07 if self._version_0_7 else Lengths.MESSAGE_HEADER_06
 
         # Init for first run
         first_loop = True
@@ -791,6 +814,7 @@ class Partition(object):
                 break
             try:
                 msg_batch = fetch_messages(offset)
+
                 retry_attempts = 0 # resets after every successful fetch
             except (ConnectionFailure, IOError) as ex:
                 if retry_limit is not None and retry_attempts > retry_limit:
